@@ -8,6 +8,7 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
+WHATSAPP_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'whatsapp.db')
 WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
 
 @dataclass
@@ -48,42 +49,52 @@ class MessageContext:
     after: List[Message]
 
 def get_sender_name(sender_jid: str) -> str:
+    """Look up contact name from whatsapp.db, resolving LID to phone number if needed."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = sqlite3.connect(WHATSAPP_DB_PATH)
         cursor = conn.cursor()
-        
-        # First try matching by exact JID
-        cursor.execute("""
-            SELECT name
-            FROM chats
-            WHERE jid = ?
-            LIMIT 1
-        """, (sender_jid,))
-        
-        result = cursor.fetchone()
-        
-        # If no result, try looking for the number within JIDs
-        if not result:
-            # Extract the phone number part if it's a JID
-            if '@' in sender_jid:
-                phone_part = sender_jid.split('@')[0]
-            else:
-                phone_part = sender_jid
-                
-            cursor.execute("""
-                SELECT name
-                FROM chats
-                WHERE jid LIKE ?
-                LIMIT 1
-            """, (f"%{phone_part}%",))
-            
-            result = cursor.fetchone()
-        
-        if result and result[0]:
-            return result[0]
+
+        # Extract parts from JID
+        if '@' in sender_jid:
+            user_part, server_part = sender_jid.split('@', 1)
         else:
-            return sender_jid
-        
+            # No @ means it's just the user part (phone or LID number)
+            user_part = sender_jid
+            server_part = ''
+
+        phone_number = user_part
+
+        # Check if this is a LID (either explicit @lid or check lid_map)
+        if server_part == 'lid' or server_part == '':
+            cursor.execute("""
+                SELECT pn FROM whatsmeow_lid_map WHERE lid = ?
+            """, (user_part,))
+            result = cursor.fetchone()
+            if result:
+                phone_number = result[0]
+
+        # Construct the JID for contact lookup
+        lookup_jid = phone_number + '@s.whatsapp.net'
+
+        # Look up contact by their_jid
+        cursor.execute("""
+            SELECT full_name, push_name
+            FROM whatsmeow_contacts
+            WHERE their_jid = ?
+            LIMIT 1
+        """, (lookup_jid,))
+
+        result = cursor.fetchone()
+
+        if result:
+            # Prefer full_name, fall back to push_name
+            name = result[0] or result[1]
+            if name:
+                return name
+
+        # Fall back to phone number (resolved from LID if applicable)
+        return phone_number
+
     except sqlite3.Error as e:
         print(f"Database error while getting sender name: {e}")
         return sender_jid
@@ -91,19 +102,63 @@ def get_sender_name(sender_jid: str) -> str:
         if 'conn' in locals():
             conn.close()
 
+def resolve_jid(jid: str) -> List[str]:
+    """Resolve a JID to all possible formats (phone number JID and LID JID).
+    Returns a list of JIDs to search for."""
+    jids = [jid]
+
+    try:
+        conn = sqlite3.connect(WHATSAPP_DB_PATH)
+        cursor = conn.cursor()
+
+        # Extract user part
+        if '@' in jid:
+            user_part = jid.split('@')[0]
+        else:
+            user_part = jid
+
+        # Check if this is a phone number - find corresponding LID
+        cursor.execute("SELECT lid FROM whatsmeow_lid_map WHERE pn = ?", (user_part,))
+        result = cursor.fetchone()
+        if result:
+            jids.append(f"{result[0]}@lid")
+
+        # Check if this is a LID - find corresponding phone number
+        cursor.execute("SELECT pn FROM whatsmeow_lid_map WHERE lid = ?", (user_part,))
+        result = cursor.fetchone()
+        if result:
+            jids.append(f"{result[0]}@s.whatsapp.net")
+
+        conn.close()
+    except sqlite3.Error:
+        pass
+
+    return jids
+
+def get_chat_name(chat_jid: str) -> str:
+    """Look up chat/contact name from whatsapp.db, resolving LID to phone number if needed."""
+    # For groups, just return the JID for now (group names are in a different place)
+    if chat_jid.endswith('@g.us'):
+        return chat_jid.split('@')[0]
+
+    # For individual chats, use the same logic as get_sender_name
+    return get_sender_name(chat_jid)
+
 def format_message(message: Message, show_chat_info: bool = True) -> None:
     """Print a single message with consistent formatting."""
     output = ""
-    
-    if show_chat_info and message.chat_name:
-        output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] Chat: {message.chat_name} "
+
+    if show_chat_info and message.chat_jid:
+        # Look up chat name from contacts database
+        chat_display_name = get_chat_name(message.chat_jid)
+        output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] Chat: {chat_display_name} "
     else:
         output += f"[{message.timestamp:%Y-%m-%d %H:%M:%S}] "
-        
+
     content_prefix = ""
     if hasattr(message, 'media_type') and message.media_type:
         content_prefix = f"[{message.media_type} - Message ID: {message.id} - Chat JID: {message.chat_jid}] "
-    
+
     try:
         sender_name = get_sender_name(message.sender) if not message.is_from_me else "Me"
         output += f"From: {sender_name}: {content_prefix}{message.content}\n"
@@ -168,8 +223,11 @@ def list_messages(
             params.append(sender_phone_number)
             
         if chat_jid:
-            where_clauses.append("messages.chat_jid = ?")
-            params.append(chat_jid)
+            # Resolve JID to both phone and LID formats
+            possible_jids = resolve_jid(chat_jid)
+            placeholders = ','.join(['?' for _ in possible_jids])
+            where_clauses.append(f"messages.chat_jid IN ({placeholders})")
+            params.extend(possible_jids)
             
         if query:
             where_clauses.append("LOWER(messages.content) LIKE LOWER(?)")
@@ -393,23 +451,26 @@ def list_chats(
 def search_contacts(query: str) -> List[Contact]:
     """Search contacts by name or phone number."""
     try:
-        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        conn = sqlite3.connect(WHATSAPP_DB_PATH)
         cursor = conn.cursor()
-        
-        # Split query into characters to support partial matching
-        search_pattern = '%' +query + '%'
-        
+
+        # Search pattern for partial matching
+        search_pattern = '%' + query + '%'
+
+        # Search the actual WhatsApp contacts table
         cursor.execute("""
-            SELECT DISTINCT 
-                jid,
-                name
-            FROM chats
-            WHERE 
-                (LOWER(name) LIKE LOWER(?) OR LOWER(jid) LIKE LOWER(?))
-                AND jid NOT LIKE '%@g.us'
-            ORDER BY name, jid
+            SELECT DISTINCT
+                their_jid,
+                COALESCE(full_name, push_name) as name
+            FROM whatsmeow_contacts
+            WHERE
+                (LOWER(full_name) LIKE LOWER(?)
+                 OR LOWER(push_name) LIKE LOWER(?)
+                 OR their_jid LIKE ?)
+                AND their_jid LIKE '%@s.whatsapp.net'
+            ORDER BY full_name, push_name, their_jid
             LIMIT 50
-        """, (search_pattern, search_pattern))
+        """, (search_pattern, search_pattern, search_pattern))
         
         contacts = cursor.fetchall()
         
