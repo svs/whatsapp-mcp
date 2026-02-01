@@ -1020,16 +1020,32 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		// This is an individual contact
 		logger.Infof("Getting name for contact: %s", chatJID)
 
-		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
+		// Resolve LID to phone number JID if needed
+		lookupJID := jid
+		if jid.Server == "lid" {
+			// Try to resolve LID to phone number
+			phoneNumber, err := client.Store.LIDs.GetPNForLID(context.Background(), jid)
+			if err == nil && !phoneNumber.IsEmpty() {
+				logger.Infof("Resolved LID %s to phone number %s", jid.User, phoneNumber.User)
+				lookupJID = phoneNumber
+			} else {
+				logger.Warnf("Could not resolve LID %s: %v", jid.User, err)
+			}
+		}
+
+		// Look up contact info using the resolved JID
+		contact, err := client.Store.Contacts.GetContact(context.Background(), lookupJID)
+		logger.Infof("Contact lookup for %s: err=%v, FullName='%s', PushName='%s'", lookupJID.String(), err, contact.FullName, contact.PushName)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
+		} else if err == nil && contact.PushName != "" {
+			name = contact.PushName
 		} else if sender != "" {
 			// Fallback to sender
 			name = sender
 		} else {
-			// Last fallback to JID
-			name = jid.User
+			// Last fallback to JID user (phone number if resolved)
+			name = lookupJID.User
 		}
 
 		logger.Infof("Using contact name: %s", name)
