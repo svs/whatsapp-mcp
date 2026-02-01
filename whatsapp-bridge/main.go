@@ -706,8 +706,41 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
-		fmt.Println("Message sent", success, message)
+		success, statusMsg := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		fmt.Println("Message sent", success, statusMsg)
+
+		// Store sent message in database if successful
+		if success {
+			// Determine chat JID
+			var chatJID string
+			if strings.Contains(req.Recipient, "@") {
+				chatJID = req.Recipient
+			} else {
+				chatJID = req.Recipient + "@s.whatsapp.net"
+			}
+
+			// Store the chat
+			messageStore.StoreChat(chatJID, "", time.Now())
+
+			// Store the sent message
+			msgID := fmt.Sprintf("sent_%d", time.Now().UnixNano())
+			messageStore.StoreMessage(
+				msgID,
+				chatJID,
+				client.Store.ID.User,
+				req.Message,
+				time.Now(),
+				true, // isFromMe
+				"",   // mediaType
+				"",   // filename
+				"",   // url
+				nil,  // mediaKey
+				nil,  // fileSHA256
+				nil,  // fileEncSHA256
+				0,    // fileLength
+			)
+		}
+
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
 
@@ -719,7 +752,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		// Send response
 		json.NewEncoder(w).Encode(SendMessageResponse{
 			Success: success,
-			Message: message,
+			Message: statusMsg,
 		})
 	})
 
